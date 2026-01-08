@@ -1,0 +1,199 @@
+/*
+   PROJE: Yangın ve Gaz Tespit Sistemi - VERİCİ (Transmitter)
+   DONANIM: 
+     - Servo Motor (Pin 9)
+     - Alev Sensörü (Pin A0)
+     - MQ-2 Gaz Sensörü (Pin A1)
+     - 433MHz RF Verici (Data Pin 2)
+   
+   ÖZELLİKLER:
+     - 60 ile 180 derece arası tarama
+     - Alev Risk 3 (Yakın) olunca kilitlenme
+     - Gaz Risk 2 (Orta) olunca alarm gönderme
+     - Terminal kontrolü ('d' durdur, 'c' devam et)
+*/
+
+#include <ServoTimer2.h> 
+#include <RH_ASK.h>
+#include <SPI.h>
+
+// --- RF AYARLARI ---
+// Hız: 2000bps, RX: 11 (Boş), TX: 2 (Verici Pini)
+RH_ASK rf_driver(2000, 11, 2);
+
+// --- PIN TANIMLARI ---
+const int FLAME_PIN = A0;   
+const int MQ2_PIN = A1;     
+const int SERVO_PIN = 9;
+
+ServoTimer2 myServo; 
+
+// --- VERİ PAKETİ YAPISI ---
+struct VeriPaketi {
+  uint8_t alarmDurumu; 
+  uint8_t alevRiski;   
+  uint8_t gazRiski;    
+  int alevDegeri;      
+  int gazDegeri;       
+};
+
+// --- AYARLAR ---
+int baslangicAci = 60;   // Tarama Başlangıcı
+int bitisAci = 180;      // Tarama Bitişi
+int adimAraligi = 30;    // Adım
+int beklemeSuresi = 500; // Bekleme (ms)
+
+// Hassasiyet Eşikleri
+int alevEsik = 800;      
+int gazEsik = 300;     
+
+// Değişkenler
+int control = 0;         
+int alevRisk = 0;        
+int gazRisk = 0;       
+bool sistemDurdu = false; 
+
+void setup() {
+  Serial.begin(9600);
+  if (!rf_driver.init()) Serial.println("RF Modulu Hatasi!");
+  
+  myServo.attach(SERVO_PIN);
+  servoDereceYaz(baslangicAci);
+  
+  Serial.println("--- VERICI SISTEMI BASLATILDI ---");
+  Serial.println("Mod: 60-180 Derece Tarama | Gaz Risk 2 Alarm | Alev Risk 3 Kilit");
+  delay(1000);
+}
+
+void loop() {
+  // İLERİ TARAMA
+  for (int i = baslangicAci; i <= bitisAci; i += adimAraligi) {
+    hareketEtVeKontrolEt(i);
+  }
+  // GERİ TARAMA
+  for (int i = bitisAci; i >= baslangicAci; i -= adimAraligi) {
+    hareketEtVeKontrolEt(i);
+  }
+}
+
+// ServoTimer2 Derece Çevirici Fonksiyon
+void servoDereceYaz(int derece) {
+  int pulse = map(derece, 0, 180, 750, 2250);
+  myServo.write(pulse);
+}
+
+// Ana Kontrol Bloğu
+void hareketEtVeKontrolEt(int aci) {
+  terminalKontrol(); 
+  while (sistemDurdu) { terminalKontrol(); delay(100); }
+
+  servoDereceYaz(aci); 
+  delay(beklemeSuresi); 
+  
+  terminalKontrol();
+  if (sistemDurdu) return;
+
+  // Sensör Okuma
+  int okunanAlev = analogRead(FLAME_PIN);
+  int okunanGaz = analogRead(MQ2_PIN);
+  
+  alevRiskHesapla(okunanAlev);
+  gazRiskHesapla(okunanGaz);
+
+  // Ekrana Yazdırma
+  Serial.print("Aci: "); Serial.print(aci);
+  Serial.print(" | ALEV: "); Serial.print(okunanAlev); 
+  Serial.print(" (R:"); Serial.print(alevRisk);       
+  Serial.print(") | GAZ: "); Serial.print(okunanGaz);  
+  Serial.print(" (R:"); Serial.print(gazRisk);         
+  Serial.println(")");
+
+  // Veri Paketleme
+  VeriPaketi paket;
+  
+  // ALARM ŞARTI: Alev Risk 3+ VEYA Gaz Risk 2+
+  if (alevRisk >= 3 || gazRisk >= 2) {
+    paket.alarmDurumu = 1;
+    control = 1; 
+  } else {
+    paket.alarmDurumu = 0;
+    control = 0;
+  }
+  
+  paket.alevRiski = alevRisk;
+  paket.gazRiski = gazRisk;
+  paket.alevDegeri = okunanAlev;
+  paket.gazDegeri = okunanGaz;
+
+  // RF Gönderim
+  rf_driver.send((uint8_t *)&paket, sizeof(paket));
+  rf_driver.waitPacketSent();
+
+  // KİLİTLENME ŞARTI: Sadece Alev Risk 3 ve üzeri
+  if (alevRisk >= 3) {
+    atesVarModu(okunanAlev); 
+  } 
+}
+
+// Kilitlenme Fonksiyonu
+void atesVarModu(int ilkDeger) {
+  Serial.println("\n!!! ALEV RISK 3 - SISTEM KILITLENDI !!!");
+  control = 1;
+  
+  while (true) {
+    terminalKontrol();
+    if (sistemDurdu) break; 
+
+    int alev = analogRead(FLAME_PIN);
+    int gaz = analogRead(MQ2_PIN);
+    alevRiskHesapla(alev);
+    gazRiskHesapla(gaz);
+    
+    Serial.print("[KILITLI] ALEV: "); Serial.print(alev);
+    Serial.print(" | GAZ: "); Serial.println(gaz);
+
+    VeriPaketi paket;
+    paket.alarmDurumu = 1;
+    paket.alevRiski = alevRisk;
+    paket.gazRiski = gazRisk;
+    paket.alevDegeri = alev;
+    paket.gazDegeri = gaz;
+    
+    rf_driver.send((uint8_t *)&paket, sizeof(paket));
+    rf_driver.waitPacketSent();
+    
+    // Çıkış Şartı
+    if (alevRisk < 3) {
+      control = 0;
+      Serial.println(">>> Tehlike azaldi, devam ediliyor...\n");
+      break; 
+    }
+    delay(200);
+  }
+}
+
+// Terminal Komutları
+void terminalKontrol() {
+  if (Serial.available() > 0) {
+    char komut = Serial.read();
+    if (komut == 'd' || komut == 'D') sistemDurdu = true;
+    else if (komut == 'c' || komut == 'C') sistemDurdu = false;
+  }
+}
+
+// Risk Hesaplamaları
+void alevRiskHesapla(int deger) {
+  if (deger < 200) alevRisk = 4;       
+  else if (deger < 400) alevRisk = 3;  
+  else if (deger < 600) alevRisk = 2;  
+  else if (deger < alevEsik) alevRisk = 1; 
+  else alevRisk = 0;                   
+}
+
+void gazRiskHesapla(int deger) {
+  if (deger > 700) gazRisk = 4;       
+  else if (deger > 500) gazRisk = 3;  
+  else if (deger > 400) gazRisk = 2;  
+  else if (deger > gazEsik) gazRisk = 1; 
+  else gazRisk = 0;                   
+}
